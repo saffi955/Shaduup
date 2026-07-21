@@ -1,0 +1,9 @@
+# AppShadow
+.venv/
+__pycache__/
+*.pyc
+sessions/
+examples/app_map.sample.json
+
+# graphify (regenerable; interpreter pointer is machine-specific)
+graphify-out/
