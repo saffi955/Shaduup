@@ -24,7 +24,8 @@ import threading
 import time
 from typing import Callable, Optional
 
-from config import DEBOUNCE_MS
+from config import AUTOSAVE_SECONDS, DEBOUNCE_MS
+from core.exporter import coverage_summary, write_app_map, write_session
 from core.schema import State
 from core.session import Debouncer, SessionGraph
 from capture.screenshot import ScreenshotGrabber
@@ -36,6 +37,7 @@ from scrapers.windows_uia import (
     EVENT_SYSTEM_MENUSTART,
     WindowsUIAScraper,
     WinEventListener,
+    _pid_of_hwnd,
     main_hwnd_for_pid,
 )
 
@@ -57,6 +59,20 @@ _EVENT_MAP: dict[int, tuple[str, str]] = {
 _CaptureCtx = tuple  # (hwnd:int, kind:str, action:str, manual:bool)
 _STOP = None  # sentinel put on the queue to end the worker
 
+# Win32 window classes that tell us what a window is without an event to say so.
+_CLASS_KINDS = {"#32768": "menu_open", "#32770": "dialog"}
+
+
+def _window_class(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(64)
+    _user32.GetClassNameW(hwnd, buf, 64)
+    return buf.value
+
+
+def _classify_window(hwnd: int) -> str:
+    """What kind of state is this window? Used when no event told us."""
+    return _CLASS_KINDS.get(_window_class(hwnd), "window")
+
 
 class ShadowRecorder:
     def __init__(
@@ -68,6 +84,7 @@ class ShadowRecorder:
         on_capture: Optional[Callable[[State, bool], None]] = None,
     ) -> None:
         self.pid = pid
+        self.out_dir = out_dir
         self.scraper = WindowsUIAScraper()
         self.scraper.attach(pid)
         self.graph = SessionGraph(app=app_name, pid=pid)
@@ -81,6 +98,7 @@ class ShadowRecorder:
         self._capture_q: "queue.Queue[Optional[_CaptureCtx]]" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
         self._running = False
+        self._autosave: Optional[threading.Timer] = None
 
     # -- lifecycle ------------------------------------------------------------
     def start(self) -> None:
@@ -95,9 +113,14 @@ class ShadowRecorder:
         if main:
             self._capture_q.put((main, "window", "start", False))
         self.listener.start()
+        self._schedule_autosave()
 
-    def stop(self) -> None:
+    def stop(self) -> dict[str, str]:
+        """End the session, write every artefact, and return the paths written."""
         self._running = False
+        if self._autosave is not None:
+            self._autosave.cancel()
+            self._autosave = None
         self.listener.stop()
         self.debouncer.cancel()
         self._capture_q.put(_STOP)
@@ -105,10 +128,36 @@ class ShadowRecorder:
             self._worker.join(3.0)
             self._worker = None
         self.grabber.close()
+        return write_session(self.graph.session, self.out_dir)
+
+    # -- autosave -------------------------------------------------------------
+    def _schedule_autosave(self) -> None:
+        if not self._running:
+            return
+        self._autosave = threading.Timer(AUTOSAVE_SECONDS, self._do_autosave)
+        self._autosave.daemon = True
+        self._autosave.start()
+
+    def _do_autosave(self) -> None:
+        """Flush the map to disk periodically so a crash never loses a session."""
+        try:
+            write_app_map(self.graph.session, self.out_dir)
+        except OSError as exc:
+            print(f"[autosave-error] {exc}")
+        self._schedule_autosave()
 
     def manual_capture(self) -> None:
-        """Force a capture of the foreground window now (the fallback hotkey)."""
-        hwnd = _user32.GetForegroundWindow() or main_hwnd_for_pid(self.pid)
+        """Force a capture of the target's foreground window (the fallback hotkey).
+
+        The foreground window is only used when it actually belongs to the target
+        process. The hotkey is global, so it fires wherever your focus happens to
+        be, and capturing whatever unrelated app was in front would put a stranger's
+        window (and its screenshot) into the map. When focus is elsewhere, fall
+        back to the target's own main window.
+        """
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd or _pid_of_hwnd(int(hwnd)) != self.pid:
+            hwnd = main_hwnd_for_pid(self.pid)
         if hwnd:
             self._capture_q.put((int(hwnd), "manual", "manual_capture", True))
 
@@ -166,7 +215,14 @@ class ShadowRecorder:
         hwnd, kind, action, manual = ctx
         if not _user32.IsWindow(hwnd):
             return  # the window (often a menu) closed before we got to it
-        snap_kind = "manual" if manual else kind
+        # A manual capture has no event to say what it is, so classify it from
+        # the window itself. Using a literal "manual" kind here would be worse
+        # than useless: it tells a reading agent nothing about what the screen
+        # IS, and because the kind is part of the tree hash it would stop a
+        # manual capture from ever deduping against the same screen captured
+        # automatically, filling the map with duplicate nodes. The `manual`
+        # flag below is what records how the capture was triggered.
+        snap_kind = _classify_window(hwnd) if manual else kind
         # Empty id -> the graph assigns a real one (or dedups to an existing node).
         state = self._snapshot_retry(hwnd, snap_kind)
         if state is None:
@@ -218,7 +274,6 @@ class ShadowRecorder:
 # --- CLI: the Phase 3 end-to-end test loop ----------------------------------
 def _main(argv: Optional[list[str]] = None) -> int:
     import argparse
-    import json
     import os
 
     from config import OUTPUT_DIR, set_dpi_awareness
@@ -262,19 +317,12 @@ def _main(argv: Optional[list[str]] = None) -> int:
         time.sleep(args.seconds)
     except KeyboardInterrupt:
         pass
-    rec.stop()
+    written = rec.stop()
 
-    # Write the raw session map (the polished exporter is Phase 5).
-    app_map = os.path.join(out_dir, "app_map.json")
-    with open(app_map, "w", encoding="utf-8") as fh:
-        json.dump(rec.graph.session.to_dict(), fh, indent=2, ensure_ascii=False)
-
-    cov = rec.graph.coverage()
     print("\n--- session summary ---")
-    print(f"states={cov['states']} controls={cov['controls']} unexplored={cov['unexplored']}")
-    for sid, gaps in rec.graph.unexplored_report():
-        print(f"  {sid}: {len(gaps)} unexplored")
-    print(f"wrote {app_map}")
+    print(coverage_summary(rec.graph.session))
+    for label, path in written.items():
+        print(f"wrote {label}: {path}")
     return 0
 
 

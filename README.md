@@ -99,6 +99,16 @@ Two other entry points are useful on their own:
 .venv\Scripts\python recorder.py --title-re ".*YourApp.*" --seconds 60 --app "YourApp.exe"
 ```
 
+## Tests
+
+The core invariants (the JSON contract, the deduplication fingerprint, edge wiring, the debounce timer, and the exporters) are covered by a suite that needs no live application and no dependencies beyond the standard library:
+
+```bash
+.venv\Scripts\python tests\test_core.py     # or: python -m pytest tests/
+```
+
+The scraper itself needs a real target to be meaningful, so its behaviour is documented through measured findings in [`docs/`](docs/) rather than mocked.
+
 ## Architecture
 
 The core is deliberately platform agnostic. Everything that knows about Windows lives behind one abstract interface, which is what will let this project grow scrapers for the web, macOS, or Android without touching a single line of the schema or the session graph.
@@ -110,19 +120,32 @@ appshadow/
 ├─ config.py                DPI awareness, timing, hotkeys, redaction rules
 ├─ core/
 │  ├─ schema.py             Control, Edge, State, Session (the JSON contract)
-│  └─ session.py            tree hash diff engine, debounce, coverage tracking
+│  ├─ session.py            tree hash diff engine, debounce, coverage tracking
+│  └─ exporter.py           app_map.json, graph.mmd, coverage report, sharding
 ├─ scrapers/
 │  ├─ base.py                abstract Scraper interface, the cross-platform seam
 │  └─ windows_uia.py         pywinauto UIA walker + WinEventHook listener
 ├─ capture/
 │  └─ screenshot.py          mss window region grabs
 ├─ examples/                a hand built sample session and a React component rebuilt from nothing but its JSON
+├─ tests/                   core invariants, no live application required
 └─ docs/                     findings from testing against a real compiled application
 ```
 
 ## What is built and what is next
 
-Capturing a live session end to end already works: the event listener, the debounce and diff engine, the UIA snapshot function, window scoped screenshots, the recorder window, global hotkeys, and a coverage report on Stop. What remains on the roadmap is a dedicated exporter that emits a Mermaid graph alongside the JSON, periodic autosave during long sessions, per menu sharding for very large applications, and the additional scrapers (web, macOS, Android) that `scrapers/base.py` already reserves a seam for.
+Capturing a live session end to end works today: the event listener, the debounce and diff engine, the UIA snapshot function, window scoped screenshots, the recorder window, global hotkeys, autosave during long sessions, and on Stop a coverage report plus the three artefacts below.
+
+```
+session_2026-07-21_1432/
+├─ app_map.json      the structured map, feed this to your agent
+├─ graph.mmd         Mermaid state diagram of the same graph
+└─ screenshots/      state_0001.png … state_00NN.png
+```
+
+The Mermaid diagram shapes each node by what it is (rectangle for a window, stadium for a menu, hexagon for a dialog) and gives a dashed border to any screen whose controls UI Automation could not see, so the gaps that need a vision pass are visible in the picture rather than buried in the JSON.
+
+What remains on the roadmap: per menu sharding is implemented but not yet wired to a command line flag, and the additional scrapers (web, macOS, Android) that `scrapers/base.py` already reserves a seam for.
 
 ## License
 

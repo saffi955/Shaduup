@@ -21,7 +21,6 @@ the captured rects agree with what is actually on screen.
 from __future__ import annotations
 
 import ctypes
-import json
 import os
 import queue
 import time
@@ -33,6 +32,7 @@ from config import HOTKEY_CAPTURE, HOTKEY_STOP, OUTPUT_DIR, set_dpi_awareness
 
 set_dpi_awareness()  # MUST run before the first window is created
 
+from core.exporter import coverage_summary  # noqa: E402
 from recorder import ShadowRecorder  # noqa: E402
 
 _user32 = ctypes.windll.user32
@@ -264,12 +264,10 @@ class RecorderApp:
         if not self.recording or self.rec is None:
             return
         self._unregister_hotkeys()
-        self.rec.stop()
+        written = self.rec.stop()  # flushes app_map.json + graph.mmd
         self.recording = False
 
-        app_map = os.path.join(self.out_dir, "app_map.json")
-        with open(app_map, "w", encoding="utf-8") as fh:
-            json.dump(self.rec.graph.session.to_dict(), fh, indent=2, ensure_ascii=False)
+        app_map = written["app_map"]
         cov = self.rec.graph.coverage()
         unexplored = cov.get("unexplored", 0)
 
@@ -283,7 +281,8 @@ class RecorderApp:
             text=f"Saved {cov['states']} states · {unexplored} unexplored → app_map.json",
             fg=GREEN)
         self.last_evt.configure(text=os.path.abspath(app_map))
-        print(f"[stop] wrote {app_map}  (coverage: {cov})")
+        print(f"[stop] wrote {app_map} and {written['graph']}")
+        print(coverage_summary(self.rec.graph.session))
 
     # -- capture feedback (worker thread → UI via queue) ----------------------
     def _on_capture(self, state, is_new: bool) -> None:
