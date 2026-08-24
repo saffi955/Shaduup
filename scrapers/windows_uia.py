@@ -79,6 +79,16 @@ _WINDOW_CHROME_NAMES = frozenset(
     {"Minimize", "Maximize", "Restore", "Close", "System", "Application"}
 )
 
+# The subset that is genuinely window management: drawn by Windows, present on
+# almost every window, and not a feature of the application being mapped. These
+# are flagged `chrome` so the coverage report ignores them — a map that could
+# only reach "nothing left to explore" by clicking Close would never reach it.
+# "Application" is excluded here: it is the name of the app's own menu bar.
+_CHROME_CONTROL_NAMES = frozenset(
+    {"Minimize", "Maximize", "Restore", "Close", "System"}
+)
+_CHROME_TYPES = frozenset({"TitleBar"})
+
 
 def _make_cache_request():
     cr = _UIA.CreateCacheRequest()
@@ -230,6 +240,7 @@ class WindowsUIAScraper(Scraper):
                 name=name,
                 rect=r,
                 enabled=enabled,
+                chrome=type_name in _CHROME_TYPES or name in _CHROME_CONTROL_NAMES,
                 automation_id=automation_id or None,
                 shortcut=accelerator or None,
                 value_redacted=redacted,

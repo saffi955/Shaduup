@@ -90,6 +90,40 @@ def test_edge_serialises_from_as_from():
     assert "from_state" not in d
 
 
+def test_window_chrome_is_excluded_from_coverage():
+    """Otherwise "nothing left to explore" is only reachable by clicking Close."""
+    state = State(
+        state_id="state_0001",
+        kind="window",
+        controls=[
+            Control(type="Button", name="Minimize", chrome=True),
+            Control(type="Button", name="Close", chrome=True),
+            Control(type="MenuItem", name="File"),
+        ],
+    )
+    assert state.unexplored() == ["MenuItem:File"], state.unexplored()
+
+    followed = State(state_id="state_0002", kind="window", controls=[
+        Control(type="Button", name="Close", chrome=True),
+        Control(type="MenuItem", name="File", leads_to="state_0003"),
+    ])
+    assert followed.unexplored() == [], "a complete pass must be able to reach zero"
+
+
+def test_chrome_control_is_kept_in_the_map():
+    """Excluded from coverage is not the same as deleted: the frame still exists."""
+    d = Control(type="Button", name="Close", chrome=True).to_dict()
+    assert d["name"] == "Close" and d["chrome"] is True
+    assert "leads_to" not in d, "chrome must not read as an unexplored gap"
+
+
+def test_redacted_field_is_not_an_unexplored_gap():
+    state = State(state_id="state_0001", kind="dialog", controls=[
+        Control(type="Edit", name="File name", value_redacted=True),
+    ])
+    assert state.unexplored() == []
+
+
 def test_unexplored_lists_only_unfollowed_actionable_controls():
     state = State(
         state_id="state_0001",
@@ -263,6 +297,43 @@ def test_shards_preserve_every_state():
     assert paths
     total = sum(json.load(open(p, encoding="utf-8"))["state_count"] for p in paths)
     assert total == len(session.states), (total, len(session.states))
+
+
+# --- screenshot redaction -----------------------------------------------------
+def test_paint_out_blanks_only_the_given_rect():
+    """A screenshot is pixel-accurate, so redacted fields must be painted out."""
+    from capture.screenshot import _paint_out
+
+    w, h = 10, 4
+    rgb = bytes([255]) * (w * h * 3)                      # all white
+    # redact x 2..5, y 1..3, given in screen coords with the window at (100, 50)
+    out = _paint_out(rgb, w, h, [[102, 51, 105, 53]], 100, 50)
+
+    def px(x, y):
+        i = (y * w + x) * 3
+        return out[i:i + 3]
+
+    assert px(2, 1) == b"\x00\x00\x00", "inside the rect must be blanked"
+    assert px(4, 2) == b"\x00\x00\x00", "inside the rect must be blanked"
+    assert px(1, 1) == b"\xff\xff\xff", "left of the rect must be untouched"
+    assert px(5, 1) == b"\xff\xff\xff", "right edge is exclusive"
+    assert px(2, 0) == b"\xff\xff\xff", "above the rect must be untouched"
+    assert px(2, 3) == b"\xff\xff\xff", "bottom edge is exclusive"
+    assert len(out) == len(rgb)
+
+
+def test_paint_out_clamps_rects_that_hang_off_the_window():
+    """A field partly outside the window must not corrupt neighbouring rows."""
+    from capture.screenshot import _paint_out
+
+    w, h = 6, 3
+    rgb = bytes([255]) * (w * h * 3)
+    out = _paint_out(rgb, w, h, [[-50, -50, 500, 500]], 0, 0)
+    assert out == b"\x00" * len(rgb), "a rect covering everything blanks everything"
+    assert len(out) == len(rgb)
+
+    untouched = _paint_out(rgb, w, h, [[900, 900, 950, 950]], 0, 0)
+    assert untouched == rgb, "a rect fully outside must change nothing"
 
 
 # --- runner (so the file works without pytest) --------------------------------

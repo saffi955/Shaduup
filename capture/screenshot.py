@@ -16,7 +16,7 @@ from __future__ import annotations
 import ctypes
 import os
 from ctypes import wintypes
-from typing import Optional
+from typing import Optional, Sequence
 
 import mss
 import mss.tools
@@ -28,6 +28,37 @@ def _window_rect(hwnd: int) -> tuple[int, int, int, int]:
     r = wintypes.RECT()
     _user32.GetWindowRect(hwnd, ctypes.byref(r))
     return r.left, r.top, r.right, r.bottom
+
+
+def _paint_out(
+    rgb: bytes,
+    width: int,
+    height: int,
+    rects: Sequence[Sequence[int]],
+    origin_x: int,
+    origin_y: int,
+) -> bytes:
+    """Fill each screen-coordinate rect with solid black in an RGB buffer.
+
+    ``rgb`` is row-major, 3 bytes per pixel. Rects arrive in screen coordinates
+    and are translated by the window origin, then clamped to the image, so a
+    field hanging off the edge of the window cannot write out of bounds.
+    """
+    buf = bytearray(rgb)
+    for rect in rects:
+        if not rect or len(rect) < 4:
+            continue
+        left = max(0, min(width, int(rect[0]) - origin_x))
+        top = max(0, min(height, int(rect[1]) - origin_y))
+        right = max(0, min(width, int(rect[2]) - origin_x))
+        bottom = max(0, min(height, int(rect[3]) - origin_y))
+        if right <= left or bottom <= top:
+            continue
+        blank = b"\x00" * ((right - left) * 3)
+        for y in range(top, bottom):
+            start = (y * width + left) * 3
+            buf[start:start + len(blank)] = blank
+    return bytes(buf)
 
 
 class ScreenshotGrabber:
@@ -42,8 +73,20 @@ class ScreenshotGrabber:
         # capture path).
         self._sct = mss.mss()
 
-    def grab(self, hwnd: int, state_id: str) -> Optional[str]:
+    def grab(
+        self,
+        hwnd: int,
+        state_id: str,
+        redact_rects: Optional[Sequence[Sequence[int]]] = None,
+    ) -> Optional[str]:
         """Capture the window's region. Returns the map-relative PNG path.
+
+        ``redact_rects`` are screen-coordinate rectangles of fields whose value
+        is never recorded (see ``config.REDACT_TYPES``). They are painted out
+        before the PNG is written, so the privacy rule holds for the picture as
+        well as the JSON: a screenshot is a pixel-accurate copy of the screen,
+        so without this a password or filename you typed would survive in the
+        image even though it was stripped from the map.
 
         Returns ``None`` if the window has no drawable area (e.g. it closed
         between the event and the grab — common with menus).
@@ -55,8 +98,11 @@ class ScreenshotGrabber:
 
         region = {"left": left, "top": top, "width": width, "height": height}
         shot = self._sct.grab(region)
+        pixels = shot.rgb
+        if redact_rects:
+            pixels = _paint_out(pixels, width, height, redact_rects, left, top)
         path = os.path.join(self.dir, f"{state_id}.png")
-        mss.tools.to_png(shot.rgb, shot.size, output=path)
+        mss.tools.to_png(pixels, shot.size, output=path)
         return f"{self.rel_prefix}/{state_id}.png"
 
     def close(self) -> None:

@@ -75,6 +75,12 @@ class Control:
 
     ``value_redacted`` enforces the privacy rule: an Edit/Password field is
     recorded as *existing*, never with its typed contents.
+
+    ``chrome`` marks a window-management control (minimise, maximise, close,
+    the system menu). These are drawn by the operating system, not by the
+    application, so they are kept in the map but excluded from coverage: they
+    are not features to explore, and "finishing" the map by clicking Close
+    would end the recording session.
     """
 
     type: str
@@ -86,12 +92,26 @@ class Control:
     value_redacted: bool = False  # True for Edit/Password: field exists, value never stored
     leads_to: Optional[str] = None  # target state_id, or None = unexplored
     interactive: Optional[bool] = None  # None = infer from `type`
+    chrome: bool = False  # OS window decoration, not application surface
 
     def is_interactive(self) -> bool:
         """Whether this control participates in navigation / coverage."""
         if self.interactive is not None:
             return self.interactive
         return self.type in INTERACTIVE_TYPES
+
+    def counts_for_coverage(self) -> bool:
+        """Is this a control the user could still explore?
+
+        Enabled, actionable, part of the application rather than the window
+        frame, and not a field whose value is deliberately never recorded.
+        """
+        return (
+            self.enabled
+            and self.is_interactive()
+            and not self.chrome
+            and not self.value_redacted
+        )
 
     def ref(self) -> str:
         """Stable short reference used in edges and unexplored lists.
@@ -115,10 +135,13 @@ class Control:
             d["shortcut"] = self.shortcut
         if self.value_redacted:
             d["value_redacted"] = True
-        # leads_to (possibly null) is meaningful ONLY for enabled, actionable
-        # controls — that null is what powers the "unexplored" coverage report.
-        # A disabled or static control can't lead anywhere, so we omit it.
-        elif self.enabled and self.is_interactive():
+        if self.chrome:
+            d["chrome"] = True
+        # leads_to (possibly null) is meaningful ONLY for controls the coverage
+        # report can still chase — that null is exactly what "unexplored" means.
+        # A disabled, static, redacted or window-frame control can't be one, so
+        # emitting a null for it would be noise that reads as a real gap.
+        if self.counts_for_coverage():
             d["leads_to"] = self.leads_to
         return d
 
@@ -167,16 +190,15 @@ class State:
     tree_hash: Optional[str] = None
 
     def unexplored(self) -> list[str]:
-        """Refs of enabled, interactive controls that were never followed.
+        """Refs of application controls that were seen but never followed.
 
         Drives the Stop-time coverage report ("11 controls unexplored —
-        revisit File > Export?"). An empty list means a complete pass.
+        revisit File > Export?"). An empty list means a complete pass, which is
+        only an honest signal because window-frame controls are excluded: a map
+        that could only reach zero by clicking Close would never reach it.
         """
-        return [
-            c.ref()
-            for c in self.controls
-            if c.enabled and c.is_interactive() and c.leads_to is None
-        ]
+        return [c.ref() for c in self.controls
+                if c.counts_for_coverage() and c.leads_to is None]
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"state_id": self.state_id, "kind": self.kind}

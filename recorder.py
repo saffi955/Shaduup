@@ -234,8 +234,11 @@ class ShadowRecorder:
 
         # Only spend a PNG on genuinely new screens (revisits reuse the node's
         # existing shot). A menu that already closed yields no image — fine.
+        # Fields whose value is never recorded are painted out of the image too,
+        # otherwise the picture would preserve exactly what the map stripped.
         if is_new and canonical.screenshot is None:
-            rel = self.grabber.grab(hwnd, canonical.state_id)
+            redact = [c.rect for c in state.controls if c.value_redacted and c.rect]
+            rel = self.grabber.grab(hwnd, canonical.state_id, redact_rects=redact)
             if rel:
                 canonical.screenshot = rel
 

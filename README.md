@@ -51,7 +51,9 @@ Every captured screen becomes one JSON node built for an AI agent to read direct
 }
 ```
 
-Three details are doing the real work here. `leads_to: null` on an enabled control means you saw it but never clicked it, which is what lets AppShadow print an honest coverage report on Stop instead of a silent guess. `reached_by` turns a pile of flat screenshots into a graph, so the agent learns the navigation flow between screens, not just their individual layouts. And any `Edit` or `Password` control is recorded as `value_redacted: true`, meaning its existence is captured and its content never is. A single state node runs around 90 tokens, against roughly 1,500 for a screenshot described in prose. On a 60 screen application that is the difference between a 5,000 token map and a 90,000 token one.
+Three details are doing the real work here. `leads_to: null` on an enabled control means you saw it but never clicked it, which is what lets AppShadow print an honest coverage report on Stop instead of a silent guess. `reached_by` turns a pile of flat screenshots into a graph, so the agent learns the navigation flow between screens, not just their individual layouts. And any `Edit` or `Password` control is recorded as `value_redacted: true`, meaning its existence is captured and its content never is, in the screenshot as well as in the JSON.
+
+On cost, measured rather than estimated: in a real WordPad session a simple dialog node came to about 90 tokens, a menu about 290, and a dense ribbon window with 83 controls about 2,400. The whole six screen session was roughly 14,000 tokens. Describing those same screens to a model in prose runs about 1,500 tokens each and has to be redone by hand every time the app changes.
 
 ## Validated against a real, no-framework application
 
@@ -78,6 +80,10 @@ A small, always on top window that never covers the application you are mapping.
 The status strip shows a live count of captured states, menus, and dialogs. The last event line tells you exactly what was just captured and where it came from. Global hotkeys (`Ctrl+Shift+C` to force a capture, `Ctrl+Shift+X` to stop) work even while the target application has focus.
 
 ## Getting started
+
+New to this? The [user guide](docs/USER_GUIDE.md) walks through installation and a
+first recording step by step, assuming no prior experience. The short version
+follows.
 
 Requires Windows and Python 3.11 or newer.
 
@@ -129,8 +135,13 @@ appshadow/
 │  └─ screenshot.py          mss window region grabs
 ├─ examples/                a hand built sample session and a React component rebuilt from nothing but its JSON
 ├─ tests/                   core invariants, no live application required
-└─ docs/                     findings from testing against a real compiled application
+└─ docs/                     user guide, verification record, and findings from real applications
 ```
+
+Documentation lives in [`docs/`](docs/): the [user guide](docs/USER_GUIDE.md) for
+getting started, the [verification record](docs/definition_of_done.md) for what
+was measured and what fell short, and the phase findings for what testing against
+a real compiled application actually revealed.
 
 ## What is built and what is next
 
