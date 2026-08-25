@@ -25,6 +25,7 @@ from core.schema import Session, State
 __all__ = [
     "write_app_map",
     "write_mermaid",
+    "write_app_graph",
     "coverage_summary",
     "write_session",
     "write_shards",
@@ -59,19 +60,33 @@ def _mermaid_text(text: str) -> str:
     return clean[:40] if len(clean) > 40 else clean
 
 
-def _state_label(state: State) -> str:
-    """Human-readable node label for the diagram.
+def _state_name(state: State) -> str:
+    """The most informative short name available for a screen.
 
     Prefers the breadcrumb tail, because a menu popup usually inherits its
     parent window's title: three different menus would otherwise all read
-    "Untitled - MyApp" and the diagram would say nothing. Falls back to the
-    window title, then the kind.
+    "Untitled - MyApp" and the diagram would say nothing. Ribbon popups often
+    report no title at all, so the next fallback is a grouping label from the
+    screen's own contents ("Save a copy of the document" beats "window"), and
+    only then the bare kind.
     """
     if state.breadcrumb:
-        base = state.breadcrumb[-1]
-    else:
-        base = state.window_title.strip() or state.kind
-    return f"{state.state_id}: {_mermaid_text(base)}"
+        return state.breadcrumb[-1]
+    title = state.window_title.strip()
+    if title:
+        return title
+    for c in state.controls:
+        if c.type in ("Group", "ToolBar", "Tab") and c.name:
+            return c.name
+    for c in state.controls:
+        if c.name and c.counts_for_coverage():
+            return f"{c.name}…"
+    return state.kind
+
+
+def _state_label(state: State) -> str:
+    """Human-readable node label for the capture-order diagram."""
+    return f"{state.state_id}: {_mermaid_text(_state_name(state))}"
 
 
 def write_app_map(session: Session, out_dir: str, filename: str = "app_map.json") -> str:
@@ -135,6 +150,116 @@ def write_mermaid(session: Session, out_dir: str, filename: str = "graph.mmd") -
     return path
 
 
+def write_app_graph(
+    session: Session,
+    out_dir: str,
+    filename: str = "app_graph.mmd",
+    max_leaves_per_state: int = 12,
+) -> str:
+    """Write a diagram of the *application's* structure, not the capture order.
+
+    ``graph.mmd`` answers "what did the recorder do?": state_0001 to state_0002
+    to state_0003, in the order screens happened to be seen. That is useful for
+    debugging a session and almost useless for understanding an application.
+
+    This answers "how is this program organised?" instead. Each screen becomes a
+    labelled branch and its actionable controls hang off it as leaves, so what
+    you get is the real command tree: the app, its menus, the items in each menu,
+    and where following an item leads. Items that were never followed still
+    appear, marked, because "this exists but nobody opened it" is exactly what
+    someone reading the map needs to know.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    lines: list[str] = ["graph LR"]
+
+    app_label = _mermaid_text(session.app or "Application")
+    lines.append(f'    app(("{app_label}"))')
+
+    roots = [s for s in session.states if s.reached_by is None]
+    if not roots and session.states:
+        roots = [session.states[0]]
+
+    # A screen keeps its own node; a control that leads somewhere is drawn as an
+    # edge into that screen rather than as a duplicate leaf.
+    leads_to_state = {
+        c.leads_to
+        for s in session.states
+        for c in s.controls
+        if c.leads_to
+    }
+    unexplored_ids: list[str] = []
+
+    for state in session.states:
+        sid = _mermaid_id(state.state_id)
+        open_b, close_b = _SHAPES.get(state.kind, _DEFAULT_SHAPE)
+        lines.append(f'    {sid}{open_b}"{_mermaid_text(_state_name(state))}"{close_b}')
+        if state in roots or state.state_id not in leads_to_state:
+            if state.reached_by is None:
+                lines.append(f"    app --> {sid}")
+
+    # A navigation link is recorded twice, from both ends: the source control's
+    # `leads_to` points forward, and the destination's `reached_by.on` points
+    # back. Either may be filled in on its own, so both are read and the pair is
+    # de-duplicated.
+    linked: set[tuple[str, str, str]] = set()
+    for state in session.states:
+        sid = _mermaid_id(state.state_id)
+        for c in state.controls:
+            if c.leads_to and c.name:
+                linked.add((sid, _mermaid_id(c.leads_to), c.name))
+    for state in session.states:
+        rb = state.reached_by
+        if rb and rb.from_state and rb.on:
+            label = rb.on.split(":", 1)[-1] if ":" in rb.on else rb.on
+            linked.add(
+                (_mermaid_id(rb.from_state), _mermaid_id(state.state_id), label)
+            )
+
+    followed_names = {(src, name) for src, _dst, name in linked}
+
+    lines.append("")
+    for src, dst, name in sorted(linked):
+        lines.append(f'    {src} -->|"{_mermaid_text(name)}"| {dst}')
+
+    for state in session.states:
+        sid = _mermaid_id(state.state_id)
+        pending = [
+            (idx, c)
+            for idx, c in enumerate(state.controls)
+            if c.counts_for_coverage()
+            and c.name
+            and not c.leads_to
+            and (sid, c.name) not in followed_names
+        ]
+        # A busy screen can carry a hundred untouched controls. Drawing them all
+        # turns the diagram into a hairball, so the tail is summarised; the full
+        # list always remains in app_map.json and the coverage report.
+        for idx, c in pending[:max_leaves_per_state]:
+            leaf = f"{sid}_i{idx}"
+            unexplored_ids.append(leaf)
+            lines.append(f'    {leaf}["{_mermaid_text(c.name)}"]')
+            lines.append(f"    {sid} --- {leaf}")
+        overflow = len(pending) - max_leaves_per_state
+        if overflow > 0:
+            leaf = f"{sid}_more"
+            unexplored_ids.append(leaf)
+            lines.append(f'    {leaf}["+{overflow} more not opened"]')
+            lines.append(f"    {sid} --- {leaf}")
+
+    if unexplored_ids:
+        lines.append("")
+        lines.append("    classDef unexplored stroke-dasharray: 3 3")
+        # Mermaid caps how many ids one class line takes comfortably; chunk it.
+        for i in range(0, len(unexplored_ids), 40):
+            chunk = ",".join(unexplored_ids[i:i + 40])
+            lines.append(f"    class {chunk} unexplored")
+
+    path = os.path.join(out_dir, filename)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
 def coverage_summary(session: Session, max_hints: int = 5) -> str:
     """A plain-language report of what was mapped and what was missed.
 
@@ -188,6 +313,7 @@ def write_session(session: Session, out_dir: str) -> dict[str, str]:
     return {
         "app_map": write_app_map(session, out_dir),
         "graph": write_mermaid(session, out_dir),
+        "app_graph": write_app_graph(session, out_dir),
     }
 
 

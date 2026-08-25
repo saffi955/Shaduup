@@ -281,7 +281,8 @@ class RecorderApp:
             text=f"Saved {cov['states']} states · {unexplored} unexplored → app_map.json",
             fg=GREEN)
         self.last_evt.configure(text=os.path.abspath(app_map))
-        print(f"[stop] wrote {app_map} and {written['graph']}")
+        for label, path in written.items():
+            print(f"[stop] wrote {label}: {path}")
         print(coverage_summary(self.rec.graph.session))
 
     # -- capture feedback (worker thread → UI via queue) ----------------------

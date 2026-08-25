@@ -230,10 +230,10 @@ def sample_session() -> Session:
     return s
 
 
-def test_write_session_produces_both_artefacts():
+def test_write_session_produces_every_artefact():
     out = tempfile.mkdtemp(prefix="appshadow_test_")
     written = write_session(sample_session(), out)
-    assert set(written) == {"app_map", "graph"}
+    assert set(written) == {"app_map", "graph", "app_graph"}
     for path in written.values():
         assert os.path.exists(path) and os.path.getsize(path) > 0
     doc = json.load(open(written["app_map"], encoding="utf-8"))
@@ -299,6 +299,116 @@ def test_shards_preserve_every_state():
     assert total == len(session.states), (total, len(session.states))
 
 
+# --- geometry, hierarchy and presentation -------------------------------------
+def test_geometry_carries_position_and_size():
+    """[x, y, w, h] window-relative is what rebuilding a layout needs."""
+    d = Control(type="Button", name="OK", rect=[30, 12, 80, 24]).to_dict()
+    x, y, w, h = d["rect"]
+    assert (x, y) == (30, 12)
+    assert (w, h) == (80, 24), "width and height must be carried, not derived"
+
+
+def test_window_rect_makes_absolute_positions_recoverable():
+    s = State(state_id="state_0001", kind="window", window_rect=[100, 50, 800, 600],
+              controls=[Control(type="Button", name="OK", rect=[30, 12, 80, 24])])
+    d = s.to_dict()
+    assert d["window_rect"] == [100, 50, 800, 600]
+    wx, wy = d["window_rect"][0], d["window_rect"][1]
+    cx, cy = d["controls"][0]["rect"][0], d["controls"][0]["rect"][1]
+    assert (wx + cx, wy + cy) == (130, 62), "absolute position must be recoverable"
+
+
+def test_depth_reconstructs_the_control_tree():
+    """A flat list plus depth is enough to rebuild nesting exactly."""
+    controls = [
+        Control(type="ToolBar", name="Formatting", depth=0),
+        Control(type="Button", name="Bold", depth=1),
+        Control(type="Button", name="Italic", depth=1),
+        Control(type="ToolBar", name="Clipboard", depth=0),
+        Control(type="Button", name="Paste", depth=1),
+    ]
+    tree, stack = [], []
+    for c in controls:
+        node = {"name": c.name, "children": []}
+        del stack[c.depth:]
+        (stack[-1]["children"] if stack else tree).append(node)
+        stack.append(node)
+    assert [n["name"] for n in tree] == ["Formatting", "Clipboard"]
+    assert [n["name"] for n in tree[0]["children"]] == ["Bold", "Italic"]
+    assert [n["name"] for n in tree[1]["children"]] == ["Paste"]
+
+
+def test_presentation_fields_are_emitted_only_when_known():
+    plain = Control(type="Button", name="OK").to_dict()
+    for absent in ("depth", "help_text", "checked", "expanded", "selected", "class_name"):
+        assert absent not in plain, f"{absent} should stay out of the map when unknown"
+
+    rich = Control(type="CheckBox", name="Word wrap", depth=2, class_name="Button",
+                   help_text="Wrap text at the window edge", checked=True,
+                   expanded=False, selected=True).to_dict()
+    assert rich["depth"] == 2
+    assert rich["class_name"] == "Button"
+    assert rich["help_text"] == "Wrap text at the window edge"
+    assert rich["checked"] is True
+    assert rich["expanded"] is False
+    assert rich["selected"] is True
+
+
+def test_unchecked_box_is_recorded_as_false_not_omitted():
+    """False and 'no such state' are different facts and must not collapse."""
+    d = Control(type="CheckBox", name="Word wrap", checked=False).to_dict()
+    assert d["checked"] is False
+
+
+# --- app structure graph ------------------------------------------------------
+def test_app_graph_shows_the_application_not_the_capture_order():
+    from core.exporter import write_app_graph
+
+    out = tempfile.mkdtemp(prefix="appshadow_test_")
+    text = open(write_app_graph(sample_session(), out), encoding="utf-8").read()
+
+    assert text.startswith("graph LR")
+    assert '"MyApp.exe"' in text, "the application itself should be the root"
+    # a followed control becomes a labelled edge into the screen it opens,
+    # whether the link was recorded forwards (leads_to) or backwards (reached_by)
+    assert '-->|"File"|' in text, text
+    assert '-->|"Export"|' in text, text
+    assert "state_0001 -->" in text and "state_0002 -->" in text, text
+
+
+def test_app_graph_still_shows_controls_nobody_followed():
+    """A gap has to be visible in the picture, not only in the coverage report."""
+    from core.exporter import write_app_graph
+
+    s = Session(app="MyApp.exe", pid=1)
+    s.add_state(State(state_id="state_0001", kind="window", window_title="Main",
+                      controls=[
+                          Control(type="MenuItem", name="File", leads_to="state_0002"),
+                          Control(type="MenuItem", name="Never opened"),
+                      ]))
+    s.add_state(State(state_id="state_0002", kind="menu_open", breadcrumb=["Main", "File"],
+                      reached_by=Edge("left_click", "MenuItem:File", "state_0001"),
+                      controls=[Control(type="MenuItem", name="Also never opened")]))
+
+    out = tempfile.mkdtemp(prefix="appshadow_test_")
+    text = open(write_app_graph(s, out, "gaps.mmd"), encoding="utf-8").read()
+    assert "Never opened" in text and "Also never opened" in text
+    assert "classDef unexplored" in text
+    assert '-->|"File"|' in text, "the followed control is still a real edge"
+
+
+def test_app_graph_labels_edges_with_control_names_not_state_ids():
+    from core.exporter import write_app_graph
+
+    out = tempfile.mkdtemp(prefix="appshadow_test_")
+    text = open(write_app_graph(sample_session(), out, "labels.mmd"), encoding="utf-8").read()
+    edges = [ln for ln in text.splitlines() if "-->|" in ln]
+    assert edges, "expected labelled edges"
+    for line in edges:
+        label = line.split('|"')[1].split('"|')[0]
+        assert not label.startswith("state_"), f"edge labelled with a state id: {line}"
+
+
 # --- screenshot redaction -----------------------------------------------------
 def test_paint_out_blanks_only_the_given_rect():
     """A screenshot is pixel-accurate, so redacted fields must be painted out."""
@@ -306,8 +416,8 @@ def test_paint_out_blanks_only_the_given_rect():
 
     w, h = 10, 4
     rgb = bytes([255]) * (w * h * 3)                      # all white
-    # redact x 2..5, y 1..3, given in screen coords with the window at (100, 50)
-    out = _paint_out(rgb, w, h, [[102, 51, 105, 53]], 100, 50)
+    # [x, y, w, h] window-relative: covers x 2..5, y 1..3
+    out = _paint_out(rgb, w, h, [[2, 1, 3, 2]])
 
     def px(x, y):
         i = (y * w + x) * 3
@@ -328,11 +438,11 @@ def test_paint_out_clamps_rects_that_hang_off_the_window():
 
     w, h = 6, 3
     rgb = bytes([255]) * (w * h * 3)
-    out = _paint_out(rgb, w, h, [[-50, -50, 500, 500]], 0, 0)
+    out = _paint_out(rgb, w, h, [[-50, -50, 500, 500]])
     assert out == b"\x00" * len(rgb), "a rect covering everything blanks everything"
     assert len(out) == len(rgb)
 
-    untouched = _paint_out(rgb, w, h, [[900, 900, 950, 950]], 0, 0)
+    untouched = _paint_out(rgb, w, h, [[900, 900, 50, 50]])
     assert untouched == rgb, "a rect fully outside must change nothing"
 
 

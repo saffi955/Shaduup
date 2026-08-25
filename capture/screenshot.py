@@ -35,28 +35,28 @@ def _paint_out(
     width: int,
     height: int,
     rects: Sequence[Sequence[int]],
-    origin_x: int,
-    origin_y: int,
 ) -> bytes:
-    """Fill each screen-coordinate rect with solid black in an RGB buffer.
+    """Fill each rect with solid black in an RGB buffer.
 
-    ``rgb`` is row-major, 3 bytes per pixel. Rects arrive in screen coordinates
-    and are translated by the window origin, then clamped to the image, so a
-    field hanging off the edge of the window cannot write out of bounds.
+    ``rgb`` is row-major, 3 bytes per pixel. Rects are ``[x, y, w, h]`` relative
+    to the top-left of the image, matching the geometry stored on every control,
+    and are clamped to the image so a field hanging off the edge of the window
+    cannot write out of bounds.
     """
     buf = bytearray(rgb)
     for rect in rects:
         if not rect or len(rect) < 4:
             continue
-        left = max(0, min(width, int(rect[0]) - origin_x))
-        top = max(0, min(height, int(rect[1]) - origin_y))
-        right = max(0, min(width, int(rect[2]) - origin_x))
-        bottom = max(0, min(height, int(rect[3]) - origin_y))
+        x, y, w, h = (int(v) for v in rect[:4])
+        left = max(0, min(width, x))
+        top = max(0, min(height, y))
+        right = max(0, min(width, x + w))
+        bottom = max(0, min(height, y + h))
         if right <= left or bottom <= top:
             continue
         blank = b"\x00" * ((right - left) * 3)
-        for y in range(top, bottom):
-            start = (y * width + left) * 3
+        for row in range(top, bottom):
+            start = (row * width + left) * 3
             buf[start:start + len(blank)] = blank
     return bytes(buf)
 
@@ -81,12 +81,13 @@ class ScreenshotGrabber:
     ) -> Optional[str]:
         """Capture the window's region. Returns the map-relative PNG path.
 
-        ``redact_rects`` are screen-coordinate rectangles of fields whose value
-        is never recorded (see ``config.REDACT_TYPES``). They are painted out
-        before the PNG is written, so the privacy rule holds for the picture as
-        well as the JSON: a screenshot is a pixel-accurate copy of the screen,
-        so without this a password or filename you typed would survive in the
-        image even though it was stripped from the map.
+        ``redact_rects`` are ``[x, y, w, h]`` window-relative rectangles of
+        fields whose value is never recorded (see ``config.REDACT_TYPES``), in
+        the same coordinates the map stores. They are painted out before the PNG
+        is written, so the privacy rule holds for the picture as well as the
+        JSON: a screenshot is a pixel-accurate copy of the screen, so without
+        this a password or filename you typed would survive in the image even
+        though it was stripped from the map.
 
         Returns ``None`` if the window has no drawable area (e.g. it closed
         between the event and the grab — common with menus).
@@ -100,7 +101,7 @@ class ScreenshotGrabber:
         shot = self._sct.grab(region)
         pixels = shot.rgb
         if redact_rects:
-            pixels = _paint_out(pixels, width, height, redact_rects, left, top)
+            pixels = _paint_out(pixels, width, height, redact_rects)
         path = os.path.join(self.dir, f"{state_id}.png")
         mss.tools.to_png(pixels, shot.size, output=path)
         return f"{self.rel_prefix}/{state_id}.png"

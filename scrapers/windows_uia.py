@@ -68,9 +68,32 @@ _CACHED_PROPERTIES = (
     _MOD.UIA_IsOffscreenPropertyId,
     _MOD.UIA_AcceleratorKeyPropertyId,
     _MOD.UIA_AccessKeyPropertyId,
+    # Presentation and state. These are what turn a list of names into something
+    # you could actually rebuild an interface from.
+    _MOD.UIA_ClassNamePropertyId,
+    _MOD.UIA_HelpTextPropertyId,
+    _MOD.UIA_IsPasswordPropertyId,
+    _MOD.UIA_ToggleToggleStatePropertyId,
+    _MOD.UIA_ExpandCollapseExpandCollapseStatePropertyId,
+    _MOD.UIA_SelectionItemIsSelectedPropertyId,
 )
 
 _TREESCOPE_DESCENDANTS = _MOD.TreeScope_Descendants
+_TREESCOPE_SUBTREE = _MOD.TreeScope_Subtree
+
+# ToggleState / ExpandCollapseState enum values. Only the first two of each are
+# real answers: a control with no toggle reports Indeterminate(2) and one with
+# nothing to expand reports LeafNode(3), so those must read as "no such state"
+# rather than as a genuine value. Measured on a live ribbon: every one of 93
+# elements reported ToggleState 2, which is how we know 2 is the sentinel here.
+_TOGGLE_OFF, _TOGGLE_ON = 0, 1
+_EXPAND_COLLAPSED, _EXPAND_EXPANDED = 0, 1
+
+# Pattern-backed properties are not exposed as Cached* attributes by the
+# generated interface, so they are read by property id instead.
+_PROP_TOGGLE = _MOD.UIA_ToggleToggleStatePropertyId
+_PROP_EXPAND = _MOD.UIA_ExpandCollapseExpandCollapseStatePropertyId
+_PROP_SELECTED = _MOD.UIA_SelectionItemIsSelectedPropertyId
 
 # Title-bar / system-menu controls present on essentially every window. They are
 # not app content, so they don't count towards "does this window expose real
@@ -90,10 +113,20 @@ _CHROME_CONTROL_NAMES = frozenset(
 _CHROME_TYPES = frozenset({"TitleBar"})
 
 
-def _make_cache_request():
+def _make_cache_request(subtree: bool = False):
+    """A cache request for one cross-process round trip.
+
+    With ``subtree=True`` the *tree structure* is cached as well as the
+    properties, so ``GetCachedChildren()`` walks real parent/child nesting
+    without another cross-process call per element. That nesting is what makes
+    the map usable for rebuilding a layout: a flat list of controls loses which
+    button sits inside which toolbar inside which pane.
+    """
     cr = _UIA.CreateCacheRequest()
     for prop in _CACHED_PROPERTIES:
         cr.AddProperty(prop)
+    if subtree:
+        cr.TreeScope = _TREESCOPE_SUBTREE
     return cr
 
 
@@ -130,6 +163,13 @@ def _pid_of_hwnd(hwnd: int) -> int:
     pid = wintypes.DWORD()
     _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return pid.value
+
+
+def _win_rect(hwnd: int) -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) of a window in absolute screen pixels."""
+    r = wintypes.RECT()
+    _user32.GetWindowRect(hwnd, ctypes.byref(r))
+    return int(r.left), int(r.top), int(r.right), int(r.bottom)
 
 
 def _window_title(hwnd: int) -> str:
@@ -196,6 +236,7 @@ class WindowsUIAScraper(Scraper):
     def __init__(self) -> None:
         self.pid: Optional[int] = None
         self._cache = _make_cache_request()
+        self._subtree_cache = _make_cache_request(subtree=True)
 
     def attach(self, pid: int) -> None:
         self.pid = pid
@@ -205,20 +246,41 @@ class WindowsUIAScraper(Scraper):
     def _control_type_name(type_id: int) -> str:
         return _CONTROL_TYPE_NAMES.get(type_id, f"Custom({type_id})")
 
-    def _element_to_control(self, el) -> Optional[Control]:
+    @staticmethod
+    def _cached(el, attr, default=None):
+        """Read a cached property, tolerating providers that omit it."""
+        try:
+            return getattr(el, attr)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _cached_prop(el, prop_id, default=None):
+        """Read a cached property by id, for the pattern-backed ones."""
+        try:
+            return el.GetCachedPropertyValue(prop_id)
+        except Exception:
+            return default
+
+    def _element_to_control(
+        self, el, depth: int = 0, origin: tuple[int, int] = (0, 0)
+    ) -> Optional[Control]:
         """Turn one cached UIA element into a Control, or None to drop it.
 
         Reads only cached properties (no fresh cross-process calls) and never
         touches the Value pattern, so a typed-in string is never even fetched,
-        let alone stored.
+        let alone stored. ``origin`` is the window's top-left corner, used to
+        turn screen coordinates into window-relative position and size.
         """
         try:
             if el.CachedIsOffscreen:
                 return None
             rect = el.CachedBoundingRectangle  # tagRECT: left/top/right/bottom
-            r = [int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)]
-            if r == [0, 0, 0, 0]:
+            left, top = int(rect.left), int(rect.top)
+            right, bottom = int(rect.right), int(rect.bottom)
+            if (left, top, right, bottom) == (0, 0, 0, 0):
                 return None  # non-visual element, nothing to point at
+            r = [left - origin[0], top - origin[1], right - left, bottom - top]
 
             type_name = self._control_type_name(el.CachedControlType)
             name, accelerator = _split_accelerator(
@@ -226,12 +288,35 @@ class WindowsUIAScraper(Scraper):
             )
             automation_id = el.CachedAutomationId or ""
             enabled = bool(el.CachedIsEnabled)
+            class_name = self._cached(el, "CachedClassName", "") or ""
+            help_text = self._cached(el, "CachedHelpText", "") or ""
 
-            redacted = type_name in REDACT_TYPES
+            # A password field is redacted whatever its control type claims.
+            redacted = type_name in REDACT_TYPES or bool(
+                self._cached(el, "CachedIsPassword", False)
+            )
+
+            toggle = self._cached_prop(el, _PROP_TOGGLE)
+            checked = (
+                toggle == _TOGGLE_ON
+                if toggle in (_TOGGLE_OFF, _TOGGLE_ON)
+                else None
+            )
+            expand = self._cached_prop(el, _PROP_EXPAND)
+            expanded = (
+                expand == _EXPAND_EXPANDED
+                if expand in (_EXPAND_COLLAPSED, _EXPAND_EXPANDED)
+                else None
+            )
+            # Recorded only when true. Nearly every element reports "not
+            # selected", so writing that out would add a false field to almost
+            # every control in the map to say nothing.
+            selected = True if self._cached_prop(el, _PROP_SELECTED) is True else None
+
             # Drop nameless, non-actionable noise (separators, blank panes) to
             # keep the map lean — but always keep redacted fields (a nameless
-            # Edit still matters) and anything with an automation id.
-            if not name and not automation_id and not redacted:
+            # Edit still matters) and anything carrying an id or a tooltip.
+            if not name and not automation_id and not redacted and not help_text:
                 if type_name in ("Pane", "Group", "Separator", "Text", "Image", "Custom"):
                     return None
 
@@ -245,22 +330,58 @@ class WindowsUIAScraper(Scraper):
                 shortcut=accelerator or None,
                 value_redacted=redacted,
                 leads_to=None,  # edges are wired by the session graph (Phase 3)
+                depth=depth,
+                class_name=class_name or None,
+                help_text=help_text or None,
+                checked=checked,
+                expanded=expanded,
+                selected=selected,
             )
         except Exception:
             # A control that vanished mid-walk (menus do this) — just skip it.
             return None
 
-    def _walk(self, root_element, max_controls: int) -> list[Control]:
-        cond = getattr(_UIA, "ControlViewCondition", None) or _IUIA.true_condition
-        array = root_element.FindAllBuildCache(
-            _TREESCOPE_DESCENDANTS, cond, self._cache
-        )
+    def _walk(
+        self, root_element, max_controls: int, origin: tuple[int, int] = (0, 0)
+    ) -> list[Control]:
+        """Walk the cached subtree, preserving real parent/child nesting.
+
+        The whole subtree came back in one round trip, so descending it costs
+        nothing extra. Controls are emitted depth-first in document order, each
+        carrying its nesting level, which is enough to rebuild the tree exactly.
+        """
         controls: list[Control] = []
-        length = array.Length
-        for i in range(min(length, max_controls)):
-            ctrl = self._element_to_control(array.GetElement(i))
-            if ctrl is not None:
-                controls.append(ctrl)
+
+        def descend(el, depth: int) -> None:
+            if len(controls) >= max_controls:
+                return
+            try:
+                kids = el.GetCachedChildren()
+            except Exception:
+                return
+            if kids is None:
+                return  # a leaf: providers return NULL rather than an empty array
+            try:
+                count = kids.Length
+            except Exception:
+                return
+            for i in range(count):
+                if len(controls) >= max_controls:
+                    return
+                try:
+                    child = kids.GetElement(i)
+                except Exception:
+                    continue
+                ctrl = self._element_to_control(child, depth, origin)
+                # A dropped container must not orphan its children, so descend
+                # at the same level rather than one deeper.
+                if ctrl is not None:
+                    controls.append(ctrl)
+                    descend(child, depth + 1)
+                else:
+                    descend(child, depth)
+
+        descend(root_element, 0)
         return controls
 
     # -- public API -----------------------------------------------------------
@@ -294,7 +415,15 @@ class WindowsUIAScraper(Scraper):
         except Exception:
             window_title = _window_title(hwnd)
 
-        controls = self._walk(root, max_controls)
+        # The window box, in absolute screen pixels. Control geometry is stored
+        # relative to its top-left corner, so this is what makes absolute
+        # positions recoverable without baking the monitor layout into the map.
+        wl, wt, wr, wb = _win_rect(hwnd)
+        window_rect = [wl, wt, wr - wl, wb - wt]
+
+        # One round trip brings back the properties *and* the tree structure.
+        cached_root = root.BuildUpdatedCache(self._subtree_cache)
+        controls = self._walk(cached_root, max_controls, origin=(wl, wt))
 
         # Owner-drawn heuristic (risk R1). A plain-compiled app like InPage
         # exposes its menus and window chrome to UIA but draws its toolbars,
@@ -325,6 +454,7 @@ class WindowsUIAScraper(Scraper):
             kind=kind,
             window_title=window_title,
             reached_by=reached_by,
+            window_rect=window_rect,
             controls=controls,
             needs_vision=needs_vision,
         )

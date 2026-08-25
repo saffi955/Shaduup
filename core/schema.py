@@ -85,7 +85,12 @@ class Control:
 
     type: str
     name: str = ""
-    rect: Optional[list[int]] = None  # [left, top, right, bottom], logical px
+    # [x, y, w, h] in logical pixels, relative to the top-left of the window.
+    # Window-relative on purpose: absolute screen coordinates say nothing about
+    # layout unless you also know where the window was, and they leak the user's
+    # monitor arrangement. Width and height are carried directly because that is
+    # what anyone rebuilding the interface actually needs.
+    rect: Optional[list[int]] = None
     enabled: bool = True
     automation_id: Optional[str] = None
     shortcut: Optional[str] = None  # e.g. "Ctrl+Shift+E", when UIA exposes it
@@ -93,6 +98,13 @@ class Control:
     leads_to: Optional[str] = None  # target state_id, or None = unexplored
     interactive: Optional[bool] = None  # None = infer from `type`
     chrome: bool = False  # OS window decoration, not application surface
+    # --- structure and presentation -----------------------------------------
+    depth: int = 0  # nesting level; depth+order reconstructs the control tree
+    class_name: Optional[str] = None  # native widget class, e.g. "Button"
+    help_text: Optional[str] = None  # tooltip / description shown to the user
+    checked: Optional[bool] = None  # checkbox / toggle state, when it has one
+    expanded: Optional[bool] = None  # expander or submenu state, when it has one
+    selected: Optional[bool] = None  # selection state, when it has one
 
     def is_interactive(self) -> bool:
         """Whether this control participates in navigation / coverage."""
@@ -129,10 +141,22 @@ class Control:
         # `enabled` is only worth stating when it deviates from the default.
         if not self.enabled:
             d["enabled"] = False
+        if self.depth:
+            d["depth"] = self.depth
         if self.automation_id:
             d["automation_id"] = self.automation_id
+        if self.class_name:
+            d["class_name"] = self.class_name
         if self.shortcut:
             d["shortcut"] = self.shortcut
+        if self.help_text:
+            d["help_text"] = self.help_text
+        if self.checked is not None:
+            d["checked"] = self.checked
+        if self.expanded is not None:
+            d["expanded"] = self.expanded
+        if self.selected is not None:
+            d["selected"] = self.selected
         if self.value_redacted:
             d["value_redacted"] = True
         if self.chrome:
@@ -181,6 +205,10 @@ class State:
     breadcrumb: list[str] = field(default_factory=list)
     reached_by: Optional[Edge] = None
     screenshot: Optional[str] = None  # relative path, e.g. "screenshots/state_0023.png"
+    # [x, y, w, h] of the window itself, in absolute screen pixels. Control rects
+    # are relative to this, so absolute positions stay recoverable while the
+    # control geometry remains meaningful on its own.
+    window_rect: Optional[list[int]] = None
     controls: list[Control] = field(default_factory=list)
     manual: bool = False  # captured via the manual hotkey/button, not auto-detect
     needs_vision: bool = False  # UIA was lossy here; the screenshot must be parsed too
@@ -210,6 +238,8 @@ class State:
             d["reached_by"] = self.reached_by.to_dict()
         if self.screenshot:
             d["screenshot"] = self.screenshot
+        if self.window_rect is not None:
+            d["window_rect"] = list(self.window_rect)
         d["controls"] = [c.to_dict() for c in self.controls]
         unexplored = self.unexplored()
         if unexplored:

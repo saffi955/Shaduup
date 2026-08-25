@@ -41,17 +41,25 @@ Every captured screen becomes one JSON node built for an AI agent to read direct
   "breadcrumb": ["MainWindow", "File", "Export"],
   "reached_by": { "action": "left_click", "on": "MenuItem:Export", "from": "state_0019" },
   "screenshot": "screenshots/state_0023.png",
+  "window_rect": [120, 80, 1280, 720],
   "controls": [
-    { "type": "MenuItem", "name": "Export as PDF…", "shortcut": "Ctrl+Shift+E", "leads_to": "state_0024" },
-    { "type": "MenuItem", "name": "Export as Image…", "leads_to": null },
-    { "type": "MenuItem", "name": "Publish to Web…", "enabled": false }
+    { "type": "ToolBar", "name": "Export", "rect": [312, 148, 196, 84] },
+    { "type": "MenuItem", "name": "Export as PDF…", "rect": [312, 148, 196, 24],
+      "depth": 1, "class_name": "MenuItem", "shortcut": "Ctrl+Shift+E",
+      "help_text": "Save a PDF copy of this document", "leads_to": "state_0024" },
+    { "type": "MenuItem", "name": "Export as Image…", "rect": [312, 176, 196, 24],
+      "depth": 1, "leads_to": null },
+    { "type": "MenuItem", "name": "Publish to Web…", "rect": [312, 204, 196, 24],
+      "depth": 1, "enabled": false }
   ],
   "unexplored": ["MenuItem:Export as Image…"],
   "ts": "2026-07-12T14:03:22+05:00"
 }
 ```
 
-Three details are doing the real work here. `leads_to: null` on an enabled control means you saw it but never clicked it, which is what lets AppShadow print an honest coverage report on Stop instead of a silent guess. `reached_by` turns a pile of flat screenshots into a graph, so the agent learns the navigation flow between screens, not just their individual layouts. And any `Edit` or `Password` control is recorded as `value_redacted: true`, meaning its existence is captured and its content never is, in the screenshot as well as in the JSON.
+Enough is recorded to rebuild the screen, not just list it. `rect` is `[x, y, width, height]` relative to the window, so position and size are usable directly instead of having to be derived from screen coordinates, and `window_rect` keeps the absolute position recoverable without baking the user's monitor layout into the map. `depth` carries the real nesting from the accessibility tree, so a flat list still reconstructs exactly which button sits inside which toolbar inside which pane, which is what any HTML or React rebuild needs. Where the application exposes them, `class_name`, `help_text` and the `checked` / `expanded` / `selected` flags come along too.
+
+Three details carry the navigation. `leads_to: null` on an enabled control means you saw it but never clicked it, which is what lets AppShadow print an honest coverage report on Stop instead of a silent guess. `reached_by` turns a pile of flat screenshots into a graph, so the agent learns the navigation flow between screens, not just their individual layouts. And any `Edit` or `Password` control is recorded as `value_redacted: true`, meaning its existence is captured and its content never is, in the screenshot as well as in the JSON.
 
 On cost, measured rather than estimated: in a real WordPad session a simple dialog node came to about 90 tokens, a menu about 290, and a dense ribbon window with 83 controls about 2,400. The whole six screen session was roughly 14,000 tokens. Describing those same screens to a model in prose runs about 1,500 tokens each and has to be redone by hand every time the app changes.
 
@@ -150,11 +158,14 @@ Capturing a live session end to end works today: the event listener, the debounc
 ```
 session_2026-07-21_1432/
 ├─ app_map.json      the structured map, feed this to your agent
-├─ graph.mmd         Mermaid state diagram of the same graph
+├─ app_graph.mmd     how the application is organised
+├─ graph.mmd         the order screens were captured in
 └─ screenshots/      state_0001.png … state_00NN.png
 ```
 
-The Mermaid diagram shapes each node by what it is (rectangle for a window, stadium for a menu, hexagon for a dialog) and gives a dashed border to any screen whose controls UI Automation could not see, so the gaps that need a vision pass are visible in the picture rather than buried in the JSON.
+The two diagrams answer different questions and it is worth knowing which you want. `graph.mmd` is the session: state_0001 to state_0002 to state_0003, in capture order, which is useful for checking a recording and close to useless for understanding software. `app_graph.mmd` is the program: the app at the root, each screen branching off it, and each menu item drawn as a labelled edge into whatever it opens. Controls nobody opened still appear, dashed, because "this exists and was never explored" is exactly what a reader needs to see.
+
+Both shape each node by what it is: rectangle for a window, stadium for a menu, hexagon for a dialog.
 
 What remains on the roadmap: per menu sharding is implemented but not yet wired to a command line flag, and the additional scrapers (web, macOS, Android) that `scrapers/base.py` already reserves a seam for.
 

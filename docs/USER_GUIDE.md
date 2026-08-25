@@ -172,7 +172,8 @@ named after the date and time, like `session_2026-08-24_1432`. Inside it:
 ```
 session_2026-08-24_1432/
    app_map.json      the main file, this is the one you give to an AI
-   graph.mmd         a diagram of how the screens connect
+   app_graph.mmd     a diagram of how the program is organised
+   graph.mmd         a diagram of the order screens were captured in
    screenshots/      one picture per screen
 ```
 
@@ -188,10 +189,13 @@ screen. One screen looks like this:
   "window_title": "Document - WordPad",
   "reached_by": { "action": "menu_open", "on": "MenuItem:File", "from": "state_0003" },
   "screenshot": "screenshots/state_0004.png",
+  "window_rect": [120, 80, 1280, 720],
   "controls": [
-    { "type": "MenuItem", "name": "Rich Text document", "leads_to": null },
-    { "type": "MenuItem", "name": "Plain text document", "leads_to": null },
-    { "type": "MenuItem", "name": "Other formats", "leads_to": null }
+    { "type": "Group", "name": "Save a copy of the document", "rect": [181, 4, 292, 288] },
+    { "type": "MenuItem", "name": "Rich Text document", "rect": [181, 27, 292, 53],
+      "depth": 1, "leads_to": null },
+    { "type": "MenuItem", "name": "Plain text document", "rect": [181, 186, 292, 53],
+      "depth": 1, "leads_to": null }
   ],
   "unexplored": ["MenuItem:Rich Text document"],
   "ts": "2026-08-24T14:32:10+05:00"
@@ -206,16 +210,52 @@ Reading that in plain English:
 | `kind` | What sort of screen it is: a window, an open menu, or a dialog box |
 | `window_title` | The text in the program's title bar at the time |
 | `reached_by` | How you got here. This one says you clicked File on screen `state_0003` |
+| `window_rect` | Where the window itself sat on screen, as `[x, y, width, height]` |
 | `controls` | Everything on the screen: buttons, menu items, text boxes |
+| `rect` | The control's `[x, y, width, height]`, measured from the window's top left corner |
+| `depth` | How deeply nested it is. `0` is top level, `1` is inside the thing above it, and so on |
 | `leads_to` | Where clicking that control took you. `null` means you never clicked it |
 | `unexplored` | A list of things you saw but never tried |
 
-### graph.mmd
+Some controls carry extra detail when the program provides it: `class_name` (the
+underlying widget type), `help_text` (its tooltip), and `checked`, `expanded` or
+`selected` for things like checkboxes, expanders and the currently active tab.
 
-A picture of how your screens connect, written in a format called Mermaid. To see
-it, open [mermaid.live](https://mermaid.live) and paste the file contents in. You
-get a flowchart of the program. GitHub also draws these automatically if you paste
-the contents into a fenced code block marked `mermaid`.
+### Why depth matters
+
+The controls are a flat list, but `depth` records the real nesting, so the
+original structure can be rebuilt exactly. A list like this:
+
+```
+ToolBar "Clipboard"     depth 0
+  SplitButton "Paste"   depth 1
+  Button "Cut"          depth 1
+  Button "Copy"         depth 1
+ToolBar "Font"          depth 0
+```
+
+means Paste, Cut and Copy sit inside the Clipboard toolbar, and Font is a
+separate toolbar beside it. That is the information an AI needs to reproduce a
+layout in HTML or React, rather than guessing from a screenshot.
+
+### app_graph.mmd and graph.mmd
+
+Two pictures, written in a format called Mermaid. To view either one, open
+[mermaid.live](https://mermaid.live) and paste the file contents in. GitHub also
+draws them automatically if you paste the contents into a fenced code block
+marked `mermaid`.
+
+**`app_graph.mmd` is the one you usually want.** It shows how the *program* is
+organised: the application at the left, each screen branching off it, and every
+menu item drawn as a labelled arrow into whatever it opens. Items you never
+opened still show up with a dashed outline, so you can see the parts of the
+program that are still unmapped. A screen with a lot of untouched controls gets
+summarised as "+31 more not opened" to keep the picture readable; the full list
+is always in `app_map.json`.
+
+**`graph.mmd` is the recording itself**, in the order screens were captured:
+state_0001, then state_0002, and so on. It is useful for checking that a session
+went the way you expected, and less useful for understanding the software.
 
 ### screenshots/
 
@@ -242,6 +282,19 @@ Things that work well:
 The map is designed so the assistant can answer without ever seeing a screenshot.
 The `reached_by` field is what lets it work out navigation paths rather than
 guessing from screen names.
+
+### Give it the file, not the folder
+
+This one matters and is easy to get wrong. If you point an assistant at the whole
+session folder, it will find `screenshots/` and start reading the images, which is
+slow and burns an enormous number of tokens for information that is already
+sitting in the JSON in a form it can read a hundred times more cheaply.
+
+Hand over `app_map.json` on its own. Add `app_graph.mmd` if you want the
+assistant to reason about how screens connect. Keep the screenshots back and
+bring them out only for a screen the map flags with `"needs_vision": true`, which
+is AppShadow telling you that particular screen was drawn in a way Windows could
+not describe and the picture really is the only source.
 
 If your map is very large, you do not have to paste the whole thing. The
 `core/exporter.py` module can split a map into one file per menu, so you only hand
