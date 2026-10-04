@@ -25,7 +25,7 @@ from typing import Callable, Optional
 
 from core.schema import Edge, Session, State
 
-__all__ = ["tree_hash", "Debouncer", "SessionGraph"]
+__all__ = ["tree_hash", "same_screen", "control_at", "Debouncer", "SessionGraph"]
 
 
 def tree_hash(state: State) -> str:
@@ -46,6 +46,62 @@ def tree_hash(state: State) -> str:
         parts.append("\x1d")
     blob = "".join(parts).encode("utf-8", "replace")
     return hashlib.sha1(blob).hexdigest()[:16]
+
+
+# How much of the actionable surface must survive for an in-place change to
+# count as the same screen. Measured on Calculator: a key press changes at most
+# one button (Clear <-> Clear entry) out of ~30, while switching to Scientific
+# or opening the navigation pane changes a third or more.
+SAME_SCREEN_SIMILARITY = 0.9
+
+
+def _action_keys(state: State) -> set[str]:
+    return {
+        f"{c.type}:{c.automation_id or c.name}"
+        for c in state.controls
+        if c.is_interactive() and not c.chrome
+    }
+
+
+def same_screen(a: State, b: State) -> bool:
+    """Is ``b`` the screen ``a`` with different data in it?
+
+    Used only to judge an in-place change. Pressing 5 in Calculator rewrites the
+    display text ("Display is 5"), adds an expression line and flips Clear to
+    Clear entry, and typing in Notepad puts a "*" in the window title, but none
+    of that is a new screen. So static text and the title are ignored, and the
+    actionable controls only have to mostly match. Switching Calculator to
+    Scientific swaps much of the button set, and that is a new screen.
+    """
+    if a.kind != b.kind:
+        return False
+    ka, kb = _action_keys(a), _action_keys(b)
+    if not ka and not kb:
+        return True
+    return len(ka & kb) / len(ka | kb) >= SAME_SCREEN_SIMILARITY
+
+
+def control_at(state: Optional[State], x: int, y: int) -> Optional[str]:
+    """Ref of the actionable control under screen point ``(x, y)``, if any.
+
+    The point is screen-absolute (where the mouse was clicked); control rects
+    are relative to ``state.window_rect``. When controls nest, the smallest
+    one containing the point wins, so a click lands on the button rather than
+    the pane around it.
+    """
+    if state is None or state.window_rect is None:
+        return None
+    rx, ry = x - state.window_rect[0], y - state.window_rect[1]
+    best: Optional[tuple[int, str]] = None
+    for c in state.controls:
+        if not c.rect or not c.is_interactive() or not c.enabled or c.chrome:
+            continue
+        cx, cy, cw, ch = c.rect[:4]
+        if cx <= rx < cx + cw and cy <= ry < cy + ch:
+            area = cw * ch
+            if best is None or area < best[0]:
+                best = (area, c.ref())
+    return best[1] if best else None
 
 
 class Debouncer:
@@ -115,19 +171,52 @@ class SessionGraph:
         *,
         action: str = "navigate",
         on: Optional[str] = None,
+        in_place: bool = False,
     ) -> tuple[State, bool]:
         """Fold a freshly captured state into the map.
 
         Returns ``(canonical_state, is_new)``. If the state's fingerprint was
         seen before, the existing node is reused (no duplicate) and only the
-        navigation edge is (re)wired; otherwise the state is appended. Either
-        way the edge from the previous state is recorded and — where it can be
-        matched — the source control's ``leads_to`` is filled in, which is what
-        turns ``unexplored`` from a guess into a fact.
+        source control's link is added; otherwise the state is appended. Where
+        it can be matched, the source control's ``leads_to`` is filled in,
+        which is what turns ``unexplored`` from a guess into a fact.
+
+        ``reached_by`` is written once, when a screen is first discovered, and
+        never overwritten: it answers "how was this screen first reached". A
+        later return trip (closing a menu back to the main window) is still
+        recorded through the source control's ``leads_to``, but rewriting the
+        parent would turn the map's tree into a cycle.
+
+        ``in_place=True`` marks a capture triggered by content changing inside
+        the current window. If it is still the same screen (only displayed
+        values moved, see ``same_screen``) no node is added, and the control
+        that was clicked, ``on``, is marked explored as leading back to it. Any
+        capture that lands on a screen seen earlier with different data in it
+        (Scientific back to Standard, another number on the display) reuses
+        that node too, as long as the window title matches.
         """
         with self._lock:
             h = state.tree_hash = tree_hash(state)
+            current = self._by_id.get(self.current_id) if self.current_id else None
+            if (
+                in_place
+                and current is not None
+                and same_screen(current, state)
+            ):
+                if on:
+                    self._link_leads_to(current, on, current.state_id)
+                return current, False
+
             existing_id = self._by_hash.get(h)
+            if existing_id is None:
+                existing_id = next(
+                    (
+                        s.state_id
+                        for s in self.session.states
+                        if s.window_title == state.window_title and same_screen(s, state)
+                    ),
+                    None,
+                )
 
             if existing_id is not None:
                 canonical = self._by_id[existing_id]
@@ -147,14 +236,23 @@ class SessionGraph:
             if self.current_id is not None and self.current_id != canonical.state_id:
                 source = self._by_id.get(self.current_id)
                 edge_on = on or self._guess_source_control(source, canonical)
-                canonical.reached_by = Edge(
-                    action=action, on=edge_on or "", from_state=self.current_id
-                )
+                if is_new:
+                    canonical.reached_by = Edge(
+                        action=action, on=edge_on or "", from_state=self.current_id
+                    )
                 if source is not None and edge_on:
                     self._link_leads_to(source, edge_on, canonical.state_id)
+            elif on and current is canonical:
+                # A click that changed the screen's data but landed back on a
+                # screen already known as this one.
+                self._link_leads_to(canonical, on, canonical.state_id)
 
             self.current_id = canonical.state_id
             return canonical, is_new
+
+    def current_state(self) -> Optional[State]:
+        with self._lock:
+            return self._by_id.get(self.current_id) if self.current_id else None
 
     @staticmethod
     def _guess_source_control(source: Optional[State], dest: State) -> Optional[str]:

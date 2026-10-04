@@ -26,6 +26,7 @@ import threading
 from ctypes import wintypes
 from typing import Callable, Optional
 
+from capture.screenshot import window_rect
 from config import REDACT_TYPES, set_dpi_awareness
 from core.schema import Control, Edge, State
 from scrapers.base import Scraper
@@ -76,6 +77,9 @@ _CACHED_PROPERTIES = (
     _MOD.UIA_ToggleToggleStatePropertyId,
     _MOD.UIA_ExpandCollapseExpandCollapseStatePropertyId,
     _MOD.UIA_SelectionItemIsSelectedPropertyId,
+    # Lets the walk notice a separate top-level window (an owned dialog) that
+    # UIA nests inside its owner's tree.
+    _MOD.UIA_NativeWindowHandlePropertyId,
 )
 
 _TREESCOPE_DESCENDANTS = _MOD.TreeScope_Descendants
@@ -166,10 +170,101 @@ def _pid_of_hwnd(hwnd: int) -> int:
 
 
 def _win_rect(hwnd: int) -> tuple[int, int, int, int]:
-    """(left, top, right, bottom) of a window in absolute screen pixels."""
-    r = wintypes.RECT()
-    _user32.GetWindowRect(hwnd, ctypes.byref(r))
-    return int(r.left), int(r.top), int(r.right), int(r.bottom)
+    """(left, top, right, bottom) of a window's visible frame, screen pixels.
+
+    Shared with the screenshot grabber so control rects and the PNG agree on
+    where the window's top-left corner is.
+    """
+    return window_rect(hwnd)
+
+
+_DWMWA_CLOAKED = 14
+_GA_ROOT = 2
+_FRAME_HOST_EXE = "applicationframehost.exe"
+
+
+def _is_cloaked(hwnd: int) -> bool:
+    """True for a window DWM is hiding even though it reports itself visible.
+
+    Suspended UWP frames (a Settings window you closed, apps parked in the
+    background) stay WS_VISIBLE with a real size but are cloaked, so without
+    this check they look like perfectly good candidates for the main window.
+    """
+    cloaked = wintypes.DWORD()
+    try:
+        hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            wintypes.HWND(hwnd), _DWMWA_CLOAKED, ctypes.byref(cloaked),
+            ctypes.sizeof(cloaked),
+        )
+    except OSError:
+        return False
+    return hr == 0 and cloaked.value != 0
+
+
+def process_name(pid: int) -> str:
+    """Basename of a process's executable, or '' if it can't be read."""
+    import os
+
+    h = _kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if _kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return os.path.basename(buf.value)
+        return ""
+    finally:
+        _kernel32.CloseHandle(h)
+
+
+def is_frame_host(pid: int) -> bool:
+    """Is ``pid`` ApplicationFrameHost, the shared shell around every UWP app?"""
+    return process_name(pid).lower() == _FRAME_HOST_EXE
+
+
+def root_window(hwnd: int) -> int:
+    """The top-level window that owns ``hwnd`` (itself if already top-level)."""
+    if not hwnd:
+        return 0
+    return int(_user32.GetAncestor(hwnd, _GA_ROOT) or hwnd)
+
+
+def window_pids(hwnd: int) -> set[int]:
+    """Every process drawing into ``hwnd``: its owner plus any child's owner.
+
+    A Win32 app answers with one pid. A UWP app answers with two: the
+    ApplicationFrameHost frame and the real app process (CalculatorApp.exe)
+    whose CoreWindow is parented inside it. Events from the content arrive
+    under the second pid, so the listener has to hook both.
+    """
+    pids = {_pid_of_hwnd(hwnd)}
+
+    def _cb(child, _lparam):
+        pids.add(_pid_of_hwnd(child))
+        return True
+
+    _user32.EnumChildWindows(hwnd, _WNDENUMPROC(_cb), 0)
+    pids.discard(0)
+    return pids
+
+
+def content_pid(hwnd: int) -> int:
+    """The process that actually *is* the app behind ``hwnd``.
+
+    For a UWP frame that is the hosted app, not ApplicationFrameHost.
+    """
+    own = _pid_of_hwnd(hwnd)
+    if is_frame_host(own):
+        for pid in window_pids(hwnd):
+            if pid != own:
+                return pid
+    return own
+
+
+def _hosts_content(hwnd: int) -> bool:
+    """A frame-host window that actually has an app parented inside it."""
+    return len(window_pids(hwnd)) > 1
 
 
 def _window_title(hwnd: int) -> str:
@@ -179,16 +274,21 @@ def _window_title(hwnd: int) -> str:
     return buf.value
 
 
+def _on_screen(hwnd: int) -> bool:
+    """Visible, not cloaked, not minimised: a window the user can actually see."""
+    return bool(
+        _user32.IsWindowVisible(hwnd)
+        and not _user32.IsIconic(hwnd)
+        and not _is_cloaked(hwnd)
+    )
+
+
 def top_level_windows(pid: int) -> list[int]:
-    """Visible, titled, top-level window handles owned by ``pid``."""
+    """On-screen, titled, top-level window handles owned by ``pid``."""
     found: list[int] = []
 
     def _cb(hwnd, _lparam):
-        if (
-            _user32.IsWindowVisible(hwnd)
-            and _pid_of_hwnd(hwnd) == pid
-            and _window_title(hwnd)
-        ):
+        if _pid_of_hwnd(hwnd) == pid and _window_title(hwnd) and _on_screen(hwnd):
             found.append(hwnd)
         return True
 
@@ -197,28 +297,42 @@ def top_level_windows(pid: int) -> list[int]:
 
 
 def main_hwnd_for_pid(pid: int) -> Optional[int]:
-    """Best guess at the app's primary window: the largest visible one."""
+    """Best guess at the app's primary window.
+
+    The foreground window wins when it belongs to ``pid``, because that is the
+    one the user is looking at; otherwise the largest on-screen one. Cloaked
+    and minimised windows never qualify. For ApplicationFrameHost, which owns
+    the frame of *every* running UWP app, only frames that really host an app
+    count, so a suspended Settings frame can't be mistaken for Calculator. Even
+    then the pid alone can't say which UWP app is meant, so callers that know
+    the window (the crosshair pick, a title match) should pass it directly.
+    """
     wins = top_level_windows(pid)
+    if is_frame_host(pid):
+        wins = [w for w in wins if _hosts_content(w)]
     if not wins:
         return None
 
+    fg = int(_user32.GetForegroundWindow() or 0)
+    if fg in wins:
+        return fg
+
     def _area(hwnd: int) -> int:
-        r = wintypes.RECT()
-        _user32.GetWindowRect(hwnd, ctypes.byref(r))
-        return max(0, r.right - r.left) * max(0, r.bottom - r.top)
+        left, top, right, bottom = _win_rect(hwnd)
+        return max(0, right - left) * max(0, bottom - top)
 
     return max(wins, key=_area)
 
 
 def find_hwnd_by_title(title_re: str) -> Optional[int]:
-    """First visible top-level window whose title matches ``title_re``."""
+    """First on-screen top-level window whose title matches ``title_re``."""
     import re
 
     pattern = re.compile(title_re)
     match: list[int] = []
 
     def _cb(hwnd, _lparam):
-        if _user32.IsWindowVisible(hwnd):
+        if _on_screen(hwnd):
             t = _window_title(hwnd)
             if t and pattern.search(t):
                 match.append(hwnd)
@@ -325,7 +439,11 @@ class WindowsUIAScraper(Scraper):
                 name=name,
                 rect=r,
                 enabled=enabled,
-                chrome=type_name in _CHROME_TYPES or name in _CHROME_CONTROL_NAMES,
+                # UWP frames name these "Minimize Calculator" etc., but keep
+                # the plain word as the automation id, so check both.
+                chrome=type_name in _CHROME_TYPES
+                or name in _CHROME_CONTROL_NAMES
+                or automation_id in _CHROME_CONTROL_NAMES,
                 automation_id=automation_id or None,
                 shortcut=accelerator or None,
                 value_redacted=redacted,
@@ -342,7 +460,11 @@ class WindowsUIAScraper(Scraper):
             return None
 
     def _walk(
-        self, root_element, max_controls: int, origin: tuple[int, int] = (0, 0)
+        self,
+        root_element,
+        max_controls: int,
+        origin: tuple[int, int] = (0, 0),
+        root_hwnd: int = 0,
     ) -> list[Control]:
         """Walk the cached subtree, preserving real parent/child nesting.
 
@@ -372,6 +494,8 @@ class WindowsUIAScraper(Scraper):
                     child = kids.GetElement(i)
                 except Exception:
                     continue
+                if self._is_other_top_level(child, root_hwnd):
+                    continue
                 ctrl = self._element_to_control(child, depth, origin)
                 # A dropped container must not orphan its children, so descend
                 # at the same level rather than one deeper.
@@ -383,6 +507,20 @@ class WindowsUIAScraper(Scraper):
 
         descend(root_element, 0)
         return controls
+
+    def _is_other_top_level(self, el, root_hwnd: int) -> bool:
+        """Is ``el`` a separate top-level window nested under the one walked?
+
+        UIA lists a window's owned dialogs (Notepad's Font dialog) as its
+        children, so without this the main window's state swallows the dialog's
+        controls and turns into a new, wrong node while the dialog is open. The
+        dialog gets its own capture. A UWP app's CoreWindow is a *child* window
+        of its frame, not top-level, so it is kept.
+        """
+        if not root_hwnd:
+            return False
+        h = self._cached(el, "CachedNativeWindowHandle", 0) or 0
+        return bool(h) and h != root_hwnd and root_window(h) == h
 
     # -- public API -----------------------------------------------------------
     def snapshot(
@@ -423,7 +561,7 @@ class WindowsUIAScraper(Scraper):
 
         # One round trip brings back the properties *and* the tree structure.
         cached_root = root.BuildUpdatedCache(self._subtree_cache)
-        controls = self._walk(cached_root, max_controls, origin=(wl, wt))
+        controls = self._walk(cached_root, max_controls, origin=(wl, wt), root_hwnd=hwnd)
 
         # Owner-drawn heuristic (risk R1). A plain-compiled app like InPage
         # exposes its menus and window chrome to UIA but draws its toolbars,
@@ -468,6 +606,29 @@ EVENT_SYSTEM_MENUPOPUPSTART = 0x0006
 EVENT_SYSTEM_DIALOGSTART = 0x0010
 EVENT_OBJECT_SHOW = 0x8002
 
+# In-place changes: the window stays put but what it shows changes (a
+# Calculator key press, a toggled option, a pane switched inside a UWP app).
+# None of the events above fire for those, so without these nothing past the
+# first screen of a modern app would ever be captured. LOCATIONCHANGE (0x800B)
+# sits inside this range but is deliberately skipped: it fires on every caret
+# and mouse move and says nothing about content.
+EVENT_OBJECT_FOCUS = 0x8005
+EVENT_OBJECT_SELECTION = 0x8006
+EVENT_OBJECT_STATECHANGE = 0x800A
+EVENT_OBJECT_NAMECHANGE = 0x800C
+EVENT_OBJECT_VALUECHANGE = 0x800E
+EVENT_OBJECT_INVOKED = 0x8013
+IN_PLACE_EVENTS = frozenset(
+    {
+        EVENT_OBJECT_FOCUS,
+        EVENT_OBJECT_SELECTION,
+        EVENT_OBJECT_STATECHANGE,
+        EVENT_OBJECT_NAMECHANGE,
+        EVENT_OBJECT_VALUECHANGE,
+        EVENT_OBJECT_INVOKED,
+    }
+)
+
 WINEVENT_OUTOFCONTEXT = 0x0000
 WINEVENT_SKIPOWNPROCESS = 0x0002
 _WM_QUIT = 0x0012
@@ -487,21 +648,65 @@ _WINEVENTPROC = ctypes.WINFUNCTYPE(
 )
 
 
+_WH_MOUSE_LL = 14
+_WM_LBUTTONUP = 0x0202
+_LRESULT = ctypes.c_ssize_t
+
+
+class _MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt", wintypes.POINT),
+        ("mouseData", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+_LOWLEVELMOUSEPROC = ctypes.WINFUNCTYPE(
+    _LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+)
+_user32.SetWindowsHookExW.argtypes = [
+    ctypes.c_int, _LOWLEVELMOUSEPROC, wintypes.HINSTANCE, wintypes.DWORD
+]
+_user32.SetWindowsHookExW.restype = wintypes.HANDLE
+_user32.CallNextHookEx.argtypes = [
+    wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+]
+_user32.CallNextHookEx.restype = _LRESULT
+_user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+_kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+_kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+
 class WinEventListener:
-    """Subscribe to the target process's UI-change events, off the main thread.
+    """Subscribe to the target app's UI-change events, off the main thread.
 
     ``SetWinEventHook`` with ``OUTOFCONTEXT`` only delivers callbacks while the
     subscribing thread is pumping messages, so the hook lives on its own thread
     running a ``GetMessage`` loop. Each relevant event is handed to ``on_event``
     (which must be cheap and do no COM work — it just notes what changed and
-    kicks the debounce timer). The listener is filtered to ``pid`` at the OS
-    level, so unrelated apps generate no traffic here at all.
+    kicks the debounce timer). The hooks are filtered to the app's processes at
+    the OS level, so unrelated apps generate no traffic here at all. A UWP app
+    spans two processes (its frame host and the app itself), hence ``pids``.
+
+    With ``on_click`` set, a low-level mouse hook on the same thread reports
+    where each left click landed, so the recorder can tell *which* control a
+    transition came from instead of guessing from window titles.
     """
 
-    def __init__(self, pid: int, on_event: Callable[[int, int, int], None]) -> None:
-        self.pid = pid
+    def __init__(
+        self,
+        pids,
+        on_event: Callable[[int, int, int], None],
+        on_click: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        self.pids = sorted({pids} if isinstance(pids, int) else set(pids))
         self.on_event = on_event
+        self.on_click = on_click
         self._proc = _WINEVENTPROC(self._callback)  # keep a ref, or it is GC'd
+        self._mouse_proc = _LOWLEVELMOUSEPROC(self._mouse_callback)
+        self._mouse_hook = None
         self._thread: Optional[threading.Thread] = None
         self._thread_id: int = 0
         self._hooks: list[int] = []
@@ -513,6 +718,17 @@ class WinEventListener:
         except Exception:
             pass  # a listener must never die on one bad event
 
+    def _mouse_callback(self, n_code, w_param, l_param):
+        # Low-level hooks stall *all* mouse input until they return, so this
+        # only copies the point out and passes the event straight on.
+        if n_code >= 0 and w_param == _WM_LBUTTONUP and self.on_click is not None:
+            try:
+                info = ctypes.cast(l_param, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+                self.on_click(int(info.pt.x), int(info.pt.y))
+            except Exception:
+                pass
+        return _user32.CallNextHookEx(None, n_code, w_param, l_param)
+
     def start(self) -> None:
         self._thread = threading.Thread(
             target=self._run, name="appshadow-winevent", daemon=True
@@ -523,15 +739,25 @@ class WinEventListener:
     def _run(self) -> None:
         self._thread_id = _kernel32.GetCurrentThreadId()
         flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-        # One contiguous range covers foreground/menu/dialog; object-show is a
-        # separate id far up the range, so it needs its own hook.
-        for emin, emax in (
+        # One contiguous range covers foreground/menu/dialog; object-show and
+        # the in-place events are far up the range, so they get their own
+        # hooks (split around LOCATIONCHANGE, which is pure noise).
+        ranges = (
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_DIALOGSTART),
             (EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW),
-        ):
-            h = _user32.SetWinEventHook(emin, emax, 0, self._proc, self.pid, 0, flags)
-            if h:
-                self._hooks.append(h)
+            (EVENT_OBJECT_FOCUS, EVENT_OBJECT_STATECHANGE),
+            (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_VALUECHANGE),
+            (EVENT_OBJECT_INVOKED, EVENT_OBJECT_INVOKED),
+        )
+        for pid in self.pids:
+            for emin, emax in ranges:
+                h = _user32.SetWinEventHook(emin, emax, 0, self._proc, pid, 0, flags)
+                if h:
+                    self._hooks.append(h)
+        if self.on_click is not None:
+            self._mouse_hook = _user32.SetWindowsHookExW(
+                _WH_MOUSE_LL, self._mouse_proc, _kernel32.GetModuleHandleW(None), 0
+            )
         self._ready.set()
 
         msg = wintypes.MSG()
@@ -542,6 +768,9 @@ class WinEventListener:
         for h in self._hooks:
             _user32.UnhookWinEvent(h)
         self._hooks.clear()
+        if self._mouse_hook:
+            _user32.UnhookWindowsHookEx(self._mouse_hook)
+            self._mouse_hook = None
 
     def stop(self) -> None:
         if self._thread_id:
@@ -559,6 +788,24 @@ def _launch_and_wait(path: str, settle_s: float = 3.0) -> int:
     proc = subprocess.Popen([path])
     time.sleep(settle_s)  # let the splash/main window come up
     return proc.pid
+
+
+def launch_app(path: str, settle_s: float = 3.0) -> tuple[int, Optional[int]]:
+    """Launch ``path`` and return ``(pid, hwnd)`` of the window it opened.
+
+    Some launchers are only stubs: ``calc.exe`` starts CalculatorApp.exe inside
+    ApplicationFrameHost and exits at once, so its own pid never owns a window.
+    When that happens the window that just came to the foreground is taken
+    instead, which is the app the stub opened.
+    """
+    pid = _launch_and_wait(path, settle_s)
+    hwnd = main_hwnd_for_pid(pid)
+    if hwnd is None:
+        fg = int(_user32.GetForegroundWindow() or 0)
+        if fg:
+            hwnd = fg
+            pid = _pid_of_hwnd(fg)
+    return pid, hwnd
 
 
 def _main(argv: Optional[list[str]] = None) -> int:
@@ -582,8 +829,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
     pid: Optional[int] = None
 
     if args.launch:
-        pid = _launch_and_wait(args.launch)
-        print(f"[launch] pid = {pid}")
+        pid, hwnd = launch_app(args.launch)
+        print(f"[launch] pid = {pid}  hwnd = {hwnd}")
     elif args.pid:
         pid = args.pid
     elif args.title_re:

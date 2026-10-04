@@ -24,10 +24,28 @@ import mss.tools
 _user32 = ctypes.windll.user32
 
 
-def _window_rect(hwnd: int) -> tuple[int, int, int, int]:
+_DWMWA_EXTENDED_FRAME_BOUNDS = 9
+
+
+def window_rect(hwnd: int) -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) of the window as drawn, in screen pixels.
+
+    On Windows 10+ ``GetWindowRect`` includes an invisible resize border around
+    the frame (about 8 px a side), so a crop from it carries a strip of whatever
+    sits behind the window. DWM's extended frame bounds are the visible edge;
+    ``GetWindowRect`` remains the fallback when DWM can't answer.
+    """
     r = wintypes.RECT()
-    _user32.GetWindowRect(hwnd, ctypes.byref(r))
-    return r.left, r.top, r.right, r.bottom
+    try:
+        hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            wintypes.HWND(hwnd), _DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(r),
+            ctypes.sizeof(r),
+        )
+    except OSError:
+        hr = -1
+    if hr != 0 or r.right <= r.left:
+        _user32.GetWindowRect(hwnd, ctypes.byref(r))
+    return int(r.left), int(r.top), int(r.right), int(r.bottom)
 
 
 def _paint_out(
@@ -92,7 +110,7 @@ class ScreenshotGrabber:
         Returns ``None`` if the window has no drawable area (e.g. it closed
         between the event and the grab — common with menus).
         """
-        left, top, right, bottom = _window_rect(hwnd)
+        left, top, right, bottom = window_rect(hwnd)
         width, height = right - left, bottom - top
         if width <= 0 or height <= 0:
             return None

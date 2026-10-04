@@ -34,6 +34,7 @@ set_dpi_awareness()  # MUST run before the first window is created
 
 from core.exporter import coverage_summary  # noqa: E402
 from recorder import ShadowRecorder  # noqa: E402
+from scrapers.windows_uia import content_pid, process_name  # noqa: E402
 
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
@@ -54,19 +55,13 @@ WHITE = "#FFFFFF"
 _GA_ROOT = 2
 
 
-def _process_exe(pid: int) -> str:
-    """Basename of a process's executable, or '' if it can't be read."""
-    h = _kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
-    if not h:
-        return ""
-    try:
-        buf = ctypes.create_unicode_buffer(1024)
-        size = wintypes.DWORD(1024)
-        if _kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-            return os.path.basename(buf.value)
-        return ""
-    finally:
-        _kernel32.CloseHandle(h)
+def _app_exe(hwnd: int, pid: int) -> str:
+    """Executable name of the app behind a window.
+
+    For a UWP app this is the hosted app (CalculatorApp.exe), not the
+    ApplicationFrameHost.exe that owns its frame.
+    """
+    return process_name(content_pid(hwnd) if hwnd else pid)
 
 
 def _window_under_cursor() -> tuple[int, int]:
@@ -211,7 +206,7 @@ class RecorderApp:
     def _pick_motion(self, _e) -> None:
         hwnd, pid = self._live_target()
         if pid:
-            self.target_lbl.configure(text=f"{_process_exe(pid)}  (pid {pid})")
+            self.target_lbl.configure(text=f"{_app_exe(hwnd, pid)}  (pid {pid})")
 
     def _pick_release(self, _e) -> None:
         self.root.configure(cursor="arrow")
@@ -219,7 +214,7 @@ class RecorderApp:
         hwnd, pid = self._live_target()
         if pid:
             self.target_hwnd, self.target_pid = hwnd, pid
-            self.target_name = _process_exe(pid) or f"pid_{pid}"
+            self.target_name = _app_exe(hwnd, pid) or f"pid_{pid}"
             self.target_lbl.configure(text=f"{self.target_name}  (pid {pid})")
         else:
             self.target_lbl.configure(
@@ -244,6 +239,7 @@ class RecorderApp:
         os.makedirs(self.out_dir, exist_ok=True)
         self.counts = {"states": 0, "menus": 0, "dialogs": 0}
         self.rec = ShadowRecorder(self.target_pid, self.target_name, self.out_dir,
+                                  hwnd=self.target_hwnd,
                                   on_capture=self._on_capture)
         self.rec.start()
         self.recording = True

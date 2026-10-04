@@ -27,7 +27,7 @@ from core.exporter import (  # noqa: E402
     write_shards,
 )
 from core.schema import Control, Edge, Session, State  # noqa: E402
-from core.session import Debouncer, SessionGraph, tree_hash  # noqa: E402
+from core.session import Debouncer, SessionGraph, control_at, tree_hash  # noqa: E402
 
 
 # --- helpers -----------------------------------------------------------------
@@ -183,6 +183,75 @@ def test_edges_wire_and_fill_leads_to():
     assert followed.leads_to == "state_0002", "the followed control was not linked"
     untouched = next(c for c in home.controls if c.name == "Edit")
     assert untouched.leads_to is None, "an unclicked control must stay unexplored"
+
+
+def test_revisit_keeps_the_original_parent():
+    """Going back to a known screen must not rewrite how it was first reached.
+
+    Rewriting it is what turned the Calculator map into a fake cycle: the first
+    screen ended up "reached from" the screen that was reached from it.
+    """
+    g = SessionGraph(app="MyApp.exe", pid=1)
+    home, _ = g.record(main_window(), action="start")
+    menu, _ = g.record(file_menu(), action="menu_open")
+    back, _ = g.record(main_window(), action="foreground")
+    assert back is home
+    assert home.reached_by is None, f"the root grew a parent: {home.reached_by}"
+    g.record(file_menu(), action="menu_open")
+    assert menu.reached_by.from_state == "state_0001"
+
+
+def calculator(display: str, mode: str = "Standard") -> State:
+    keys = ["5", "Plus"] if mode == "Standard" else ["5", "Plus", "Sine"]
+    return State(
+        state_id="",
+        kind="window",
+        window_title="Calculator",
+        window_rect=[100, 100, 300, 500],
+        controls=[Control(type="Text", name=f"Display is {display}", rect=[0, 0, 300, 80])]
+        + [Control(type="Button", name=k, rect=[i * 60, 100, 60, 40])
+           for i, k in enumerate(keys)],
+    )
+
+
+def test_in_place_value_change_marks_the_click_explored():
+    """A Calculator key press changes the display, not the screen."""
+    g = SessionGraph(app="CalculatorApp.exe", pid=1)
+    calc, _ = g.record(calculator("0"), action="start")
+    after, is_new = g.record(calculator("5"), action="left_click",
+                             on="Button:5", in_place=True)
+    assert not is_new and after is calc, "a new display value is not a new screen"
+    assert len(g.session.states) == 1
+    five = next(c for c in calc.controls if c.name == "5")
+    assert five.leads_to == calc.state_id, "the pressed key must count as explored"
+    assert "Button:5" not in calc.unexplored()
+
+
+def test_in_place_layout_change_is_a_new_state():
+    """Switching Calculator to Scientific swaps the buttons: a real transition."""
+    g = SessionGraph(app="CalculatorApp.exe", pid=1)
+    std, _ = g.record(calculator("0"), action="start")
+    sci, is_new = g.record(calculator("0", mode="Scientific"), action="in_place",
+                           in_place=True)
+    assert is_new and sci is not std
+    assert sci.reached_by.from_state == std.state_id
+
+
+def test_in_place_return_reuses_the_earlier_screen():
+    """Back to Standard with another number shown is still the Standard node."""
+    g = SessionGraph(app="CalculatorApp.exe", pid=1)
+    std, _ = g.record(calculator("0"), action="start")
+    g.record(calculator("0", mode="Scientific"), action="in_place", in_place=True)
+    back, is_new = g.record(calculator("7"), action="in_place", in_place=True)
+    assert not is_new and back is std
+    assert len(g.session.states) == 2
+
+
+def test_control_at_hits_the_smallest_actionable_control():
+    state = calculator("0")
+    # window at (100, 100); "Plus" button is at x 60..120, y 100..140 inside it
+    assert control_at(state, 100 + 70, 100 + 110) == "Button:Plus"
+    assert control_at(state, 100 + 10, 100 + 10) is None, "static text is not a target"
 
 
 # --- debouncer ---------------------------------------------------------------

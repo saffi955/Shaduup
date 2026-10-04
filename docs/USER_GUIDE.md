@@ -403,6 +403,16 @@ Some programs draw their interface in a custom way that Windows cannot see into.
 Press `Ctrl+Shift+C` to force a capture. Those screens are marked in the map so
 you know their screenshots need a closer look.
 
+### Modern Windows apps (Calculator, Settings, Store apps)
+
+These apps run inside a shared Windows frame, so always pick them with the
+crosshair (or `--title-re` from the terminal) rather than `--pid`: the frame's
+process owns every modern app on the desktop, and only the window you picked
+says which one you mean. They also redraw their content without telling Windows,
+so AppShadow captures after each mouse click inside them. Changes you make with
+the keyboard alone (typing digits into Calculator) are not captured
+automatically; press `Ctrl+Shift+C` if you need one.
+
 ### The program I want to map shows a splash or licence screen that will not go away
 
 Just click past it yourself before pressing Start. This is exactly why AppShadow
@@ -430,11 +440,14 @@ If you would rather not use the small window, you can record from the terminal.
 This records whatever window has "Notepad" in its title for sixty seconds:
 
 ```bash
-.venv\Scripts\python recorder.py --title-re ".*Notepad.*" --seconds 60 --app "notepad.exe"
+.venv\Scripts\python recorder.py --title-re ".*Notepad.*" --seconds 60
 ```
 
 You can also target a program by its process ID with `--pid 16536`, or have
-AppShadow launch it for you with `--launch "C:\Path\To\Program.exe"`.
+AppShadow launch it for you with `--launch "C:\Path\To\Program.exe"`
+(`--launch calc.exe` works too, even though `calc.exe` only starts the real
+Calculator and exits). The session is named after the program's executable;
+pass `--app "Name"` to call it something else.
 
 There is also a way to look at a single window right now, without recording a
 session at all. This prints the structure of the window as JSON and tells you how
